@@ -2,11 +2,11 @@ from ultralytics import YOLO
 import time
 import streamlit as st
 import cv2
-from pytube import YouTube
 import os
 import shutil
 import settings
 import glob
+import yt_dlp
 
 
 
@@ -79,68 +79,82 @@ def _display_detected_frames(conf, model, st_frame, image, is_display_tracking=N
 
 def play_youtube_video(conf, model):
     """
-    Plays a webcam stream. Detects Objects in real-time using the YOLOv8 object detection model.
-
-    Parameters:
-        conf: Confidence of YOLOv8 model.
-        model: An instance of the `YOLOv8` class containing the YOLOv8 model.
-
-    Returns:
-        None
-
-    Raises:
-        None
+    Plays a YouTube video. Detects objects in real-time using the YOLOv8 model.
     """
+
     st.sidebar.write("example link 1: https://youtu.be/3F6GsMESbDc")
-    # st.sidebar.write("example link 1: https://youtu.be/3F6GsMESbDc")
     source_youtube = st.sidebar.text_input("YouTube Video url")
-    
+
     is_display_tracker, tracker = display_tracker_options()
 
-    if st.sidebar.button('Detect Drowing'):
+    if st.sidebar.button("Detect Drowing"):
         try:
             dcls = []
-            s = time.time() 
-            yt = YouTube(source_youtube)
-            stream = yt.streams.filter(file_extension="mp4", res=720).first()
-            vid_cap = cv2.VideoCapture(stream.url)
+            s = time.time()
+
+            ydl_opts = {
+                "format": "best[ext=mp4]/best",
+                "quiet": True,
+                "noplaylist": True,
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(source_youtube, download=False)
+
+                if "url" in info:
+                    video_url = info["url"]
+                else:
+                    video_url = info["formats"][-1]["url"]
+
+            vid_cap = cv2.VideoCapture(video_url)
+
+            if not vid_cap.isOpened():
+                st.sidebar.error("Unable to open YouTube video.")
+                return
 
             st_frame = st.empty()
-            while (vid_cap.isOpened()):
+
+            while vid_cap.isOpened():
                 success, image = vid_cap.read()
-                if success:
-                    n = time.time()
-                    detectCls = _display_detected_frames(conf,
-                                             model,
-                                             st_frame,
-                                             image,
-                                             is_display_tracker,
-                                             tracker
-                                             )
-                    try: 
-                        if n-s > settings.timeout:
-                            s = n
-                            from collections import Counter
+
+                if not success:
+                    break
+
+                n = time.time()
+
+                detectCls = _display_detected_frames(
+                    conf,
+                    model,
+                    st_frame,
+                    image,
+                    is_display_tracker,
+                    tracker
+                )
+
+                try:
+                    if n - s > settings.timeout:
+                        s = n
+                        from collections import Counter
+
+                        if len(dcls) > 0:
                             element_counts = Counter(dcls)
+
                             if max(element_counts, key=element_counts.get) == 0:
                                 st.write("Drowning, sending distress signal!")
-                                # audio_file = open(settings.AUDIO_PATH, 'rb')
-                                # audio_bytes = audio_file.read()
-                                # st.audio(audio_bytes, format='audio/mp4a')
                                 autoplay_audio(settings.AUDIO_PATH)
                                 send_message()
-                            dcls.clear()
-                            
-                        dcls.append(int(detectCls))
-                        # print(dcls)
-                    except:
-                        print(detectCls)
-                else:
-                    vid_cap.release()
-                    break
+
+                        dcls.clear()
+
+                    dcls.append(int(detectCls))
+
+                except Exception:
+                    pass
+
+            vid_cap.release()
+
         except Exception as e:
             st.sidebar.error("Error loading video: " + str(e))
-
 
 def play_rtsp_stream(conf, model):
     """
