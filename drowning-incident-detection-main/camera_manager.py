@@ -1,133 +1,137 @@
-import cv2
+import json
 import threading
 import time
+from pathlib import Path
+
+import cv2
 
 
 class Camera:
-
     def __init__(self, camera_id, name, location, source):
-
         self.camera_id = camera_id
         self.name = name
         self.location = location
-        self.source = source
-
-        try:
-            self.source = int(source)
-        except:
-            pass
+        self.source = self._normalize_source(source)
 
         self.cap = None
         self.frame = None
         self.online = False
         self.running = False
+        self.thread = None
+        self.lock = threading.Lock()
+
+    def _normalize_source(self, source):
+        try:
+            return int(source)
+        except (TypeError, ValueError):
+            return source
 
     def connect(self):
+        self.release()
 
-        self.cap = cv2.VideoCapture(self.source)
+        if isinstance(self.source, int):
+            self.cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+        else:
+            self.cap = cv2.VideoCapture(self.source)
 
-        if self.cap.isOpened():
+        if self.cap and self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self.online = True
-            print(f"[INFO] {self.name} Connected")
         else:
             self.online = False
-            print(f"[ERROR] {self.name} Offline")
 
-    def reconnect(self):
-
+    def release(self):
         if self.cap:
             self.cap.release()
-
-        time.sleep(2)
-
-        self.connect()
+        self.cap = None
 
     def update(self):
-
+        self.running = True
         self.connect()
 
-        self.running = True
-
         while self.running:
-
             if not self.online:
-
-                self.reconnect()
+                time.sleep(1)
+                self.connect()
+                continue
 
             success, frame = self.cap.read()
 
-            if success:
-
-                self.frame = frame
-
+            if success and frame is not None:
+                with self.lock:
+                    self.frame = frame.copy()
+                self.online = True
             else:
-
                 self.online = False
+                self.release()
+                time.sleep(1)
 
-                self.reconnect()
+            time.sleep(0.01)
+
+        self.release()
 
     def start(self):
+        if self.thread and self.thread.is_alive():
+            return
 
-        thread = threading.Thread(target=self.update)
-
-        thread.daemon = True
-
-        thread.start()
+        self.thread = threading.Thread(target=self.update, daemon=True)
+        self.thread.start()
 
     def stop(self):
-
         self.running = False
+        self.release()
 
-        if self.cap:
-            self.cap.release()
+    def snapshot(self):
+        with self.lock:
+            frame = None if self.frame is None else self.frame.copy()
+
+        return {
+            "id": self.camera_id,
+            "name": self.name,
+            "location": self.location,
+            "source": self.source,
+            "online": self.online,
+            "frame": frame,
+        }
 
 
 class CameraManager:
+    def __init__(self, config_path="camera_config.json"):
+        self.config_path = Path(config_path)
+        self.cameras = []
+        self.load_cameras()
 
-    def __init__(self):
-
+    def load_cameras(self):
+        self.stop()
         self.cameras = []
 
-    def add_camera(self,
-                   source,
-                   name,
-                   location="Unknown"):
+        if not self.config_path.exists():
+            print(f"[ERROR] Camera config not found: {self.config_path}")
+            return
 
-        camera = Camera(
-            len(self.cameras) + 1,
-            name,
-            location,
-            source
-        )
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
 
-        camera.start()
+        for cam in config.get("cameras", []):
+            if not cam.get("enabled", True):
+                continue
 
-        self.cameras.append(camera)
+            camera = Camera(
+                cam.get("id"),
+                cam.get("name", f"Camera {cam.get('id', '')}"),
+                cam.get("location", "Unknown"),
+                cam.get("source", 0),
+            )
+
+            camera.start()
+            self.cameras.append(camera)
+
+    def reload(self):
+        self.load_cameras()
 
     def get_frames(self):
-
-        data = []
-
-        for camera in self.cameras:
-
-            data.append({
-
-                "id": camera.camera_id,
-
-                "name": camera.name,
-
-                "location": camera.location,
-
-                "online": camera.online,
-
-                "frame": camera.frame
-
-            })
-
-        return data
+        return [camera.snapshot() for camera in self.cameras]
 
     def stop(self):
-
         for camera in self.cameras:
-
             camera.stop()

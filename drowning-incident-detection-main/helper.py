@@ -1,562 +1,495 @@
-from ultralytics import YOLO
+import base64
 import time
-import streamlit as st
+from pathlib import Path
+from urllib.parse import urlparse
+
 import cv2
-import os
-import shutil
-import settings
-import glob
+import streamlit as st
 import yt_dlp
-from camera_manager import CameraManager
+from ultralytics import YOLO
+
+import settings
 from alert_manager import AlertManager
-from record_manager import VideoRecorder
+from camera_manager import CameraManager
 from logger import DetectionLogger
-import dashboard
+from record_manager import VideoRecorder
 
-logger = DetectionLogger()
-
-recorder = VideoRecorder()
-
+DROWNING_CLASS_ID = 0
+DROWNING_ALERT_CONFIDENCE = 0.60
 
 
+@st.cache_resource
 def load_model(model_path):
-    """
-    Loads a YOLO object detection model from the specified model_path.
-
-    Parameters:
-        model_path (str): The path to the YOLO model file.
-
-    Returns:
-        A YOLO object detection model.
-    """
-    model = YOLO(model_path)
-    return model
+    return YOLO(model_path)
 
 
 def display_tracker_options():
-    display_tracker = st.radio("Display Tracker", ('Yes', 'No'))
-    is_display_tracker = True if display_tracker == 'Yes' else False
-    if is_display_tracker:
+    display_tracker = st.radio("Display Tracker", ("Yes", "No"))
+
+    if display_tracker == "Yes":
         tracker_type = st.radio("Tracker", ("bytetrack.yaml", "botsort.yaml"))
-        return is_display_tracker, tracker_type
-    return is_display_tracker, None
+        return True, tracker_type
+
+    return False, None
 
 
-def _display_detected_frames(conf, model, st_frame, image, is_display_tracking=None, tracker=None):
-    """
-    Display the detected objects on a video frame using the YOLOv8 model.
+def autoplay_audio(file_path):
+    audio_path = Path(file_path)
 
-    Args:
-    - conf (float): Confidence threshold for object detection.
-    - model (YoloV8): A YOLOv8 object detection model.
-    - st_frame (Streamlit object): A Streamlit object to display the detected video.
-    - image (numpy array): A numpy array representing the video frame.
-    - is_display_tracking (bool): A flag indicating whether to display object tracking (default=None).
+    if not audio_path.is_absolute():
+        audio_path = settings.ROOT / audio_path
 
-    Returns:
-    None
-    """
-    # Specify the directory from which to delete subdirectories
-    directory = "runs/detect"
-
-    # Iterate over all entries in the directory
-    for entry in os.listdir(directory):
-        path = os.path.join(directory, entry)
-        
-        # Check if the entry is a directory
-        if os.path.isdir(path):
-            # Remove the subdirectory
-            shutil.rmtree(path)
-    # Resize the image to a standard size
-    image = cv2.resize(image, (720, int(720*(9/16))))
-
-    # Display object tracking, if specified
-    if is_display_tracking:
-        res = model.track(image, conf=conf, persist=True, tracker=tracker, save=True, name='predict')
-    else:
-        # Predict the objects in the image using the YOLOv8 model
-        res = model.predict(image, conf=conf, save=True, name='predict')
-
-    # # Plot the detected objects on the video frame
-    res_plotted = res[0].plot()
-    st_frame.image(res_plotted,
-                   caption='Detected Video',
-                   channels="BGR",
-                   use_column_width=True
-                   )
-    return res[0].boxes.cls
-
-def play_youtube_video(conf, model):
-    """
-    Plays a YouTube video. Detects objects in real-time using the YOLOv8 model.
-    """
-
-    st.sidebar.write("example link 1: https://youtu.be/3F6GsMESbDc")
-    source_youtube = st.sidebar.text_input("YouTube Video url")
-
-    is_display_tracker, tracker = display_tracker_options()
-
-    if st.sidebar.button("Detect Drowing"):
-        try:
-            dcls = []
-            s = time.time()
-
-            ydl_opts = {
-                "format": "best[ext=mp4]/best",
-                "quiet": True,
-                "noplaylist": True,
-            }
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(source_youtube, download=False)
-
-                if "url" in info:
-                    video_url = info["url"]
-                else:
-                    video_url = info["formats"][-1]["url"]
-
-            vid_cap = cv2.VideoCapture(video_url)
-
-            if not vid_cap.isOpened():
-                st.sidebar.error("Unable to open YouTube video.")
-                return
-
-            st_frame = st.empty()
-
-            while vid_cap.isOpened():
-                success, image = vid_cap.read()
-
-                if not success:
-                    break
-
-                n = time.time()
-
-                detectCls = _display_detected_frames(
-                    conf,
-                    model,
-                    st_frame,
-                    image,
-                    is_display_tracker,
-                    tracker
-                )
-
-                try:
-                    if n - s > settings.timeout:
-                        s = n
-                        from collections import Counter
-
-                        if len(dcls) > 0:
-                            element_counts = Counter(dcls)
-
-                            if max(element_counts, key=element_counts.get) == 0:
-                                st.write("Drowning, sending distress signal!")
-                                autoplay_audio(settings.AUDIO_PATH)
-                                send_message()
-
-                        dcls.clear()
-
-                    dcls.append(int(detectCls))
-
-                except Exception:
-                    pass
-
-            vid_cap.release()
-
-        except Exception as e:
-            st.sidebar.error("Error loading video: " + str(e))
-
-def play_rtsp_stream(conf, model):
-    """
-    Plays an rtsp stream. Detects Objects in real-time using the YOLOv8 object detection model.
-
-    Parameters:
-        conf: Confidence of YOLOv8 model.
-        model: An instance of the `YOLOv8` class containing the YOLOv8 model.
-
-    Returns:
-        None
-
-    Raises:
-        None
-    """
-    source_rtsp = st.sidebar.text_input("rtsp stream url:")
-    st.sidebar.caption('Example URL: rtsp://admin:12345@192.168.1.210:554/Streaming/Channels/101')
-    is_display_tracker, tracker = display_tracker_options()
-    if st.sidebar.button('Detect Drowing'):
-        s = time.time()
-        dcls = []
-        try:
-            vid_cap = cv2.VideoCapture(source_rtsp)
-            st_frame = st.empty()
-            while (vid_cap.isOpened()):
-                success, image = vid_cap.read()
-                if success:
-                    n = time.time()
-                    detectCls = _display_detected_frames(conf,
-                                             model,
-                                             st_frame,
-                                             image,
-                                             is_display_tracker,
-                                             tracker
-                                             )
-                    try: 
-                        if n-s > settings.timeout:
-                            s = n
-                            from collections import Counter
-                            element_counts = Counter(dcls)
-                            if max(element_counts, key=element_counts.get) == 0:
-                                st.write("Drowning, sending distress signal!")
-                                # audio_file = open(settings.AUDIO_PATH, 'rb')
-                                # audio_bytes = audio_file.read()
-                                # st.audio(audio_bytes, format='audio/mp4a')
-                                autoplay_audio(settings.AUDIO_PATH)
-                                send_message()
-                            dcls.clear()
-                            
-                        dcls.append(int(detectCls))
-                        # print(dcls)
-                    except:
-                        print(detectCls)
-                else:
-                    vid_cap.release()
-                    break
-        except Exception as e:
-            st.sidebar.error("Error loading video from RTSP: " + str(e))
-
-def process_detection(
-    frame,
-    result,
-    recorder,
-    alert,
-    logger,
-    camera_name,
-    location
-):
-
-    try:
-        classes = result[0].boxes.cls.tolist()
-    except:
-        classes = []
-
-    if 0 not in classes:
+    if not audio_path.exists():
         return
 
-    st.warning(f"⚠ Drowning Detected : {camera_name}")
-
-    autoplay_audio(settings.AUDIO_PATH)
-
-    if not recorder.is_recording():
-
-        recorder.start(
-            frame,
-            camera_name
-        )
-
-    recorder.write(frame)
-
-    alert.trigger(
-
-        frame,
-
-        camera_name,
-
-        location,
-
-        0.95
-
-    )
-
-    logger.log(
-
-        camera_name,
-
-        location,
-
-        0.95,
-
-        "",
-
-        "",
-
-        True
-
-    )
-
-def play_webcam(conf, model):
-    """
-    Plays a webcam stream. Detects Objects in real-time using the YOLOv8 object detection model.
-
-    Parameters:
-        conf: Confidence of YOLOv8 model.
-        model: An instance of the `YOLOv8` class containing the YOLOv8 model.
-
-    Returns:
-        None
-
-    Raises:
-        None
-    """
-    source_webcam = settings.WEBCAM_PATH
-    is_display_tracker, tracker = display_tracker_options()
-    if st.sidebar.button('Detect Drowing'):
-        s = time.time()
-        dcls = []
-        try:
-            vid_cap = cv2.VideoCapture(source_webcam)
-            st_frame = st.empty()
-            while (vid_cap.isOpened()):
-                success, image = vid_cap.read()
-                if success:
-                    n = time.time()
-                    detectCls = _display_detected_frames(conf,
-                                             model,
-                                             st_frame,
-                                             image,
-                                             is_display_tracker,
-                                             tracker
-                                             )
-                    try: 
-                        if n-s > settings.timeout:
-                            s = n
-                            from collections import Counter
-                            element_counts = Counter(dcls)
-                            if max(element_counts, key=element_counts.get) == 0:
-                                st.write("Drowning, sending distress signal!")
-                                # audio_file = open(settings.AUDIO_PATH, 'rb')
-                                # audio_bytes = audio_file.read()
-                                # st.audio(audio_bytes, format='audio/mp4a')
-                                autoplay_audio(settings.AUDIO_PATH)
-                                send_message()
-                                
-                            dcls.clear()
-                            
-                        dcls.append(int(detectCls))
-                        # print(dcls)
-                    except:
-                        print(detectCls)
-                else:
-                    vid_cap.release()
-                    break
-        except Exception as e:
-            st.sidebar.error("Error loading video: " + str(e))
-
-
-def play_stored_video(conf, model):
-    """
-    Plays a stored video file. Tracks and detects objects in real-time using the YOLOv8 object detection model.
-
-    Parameters:
-        conf: Confidence of YOLOv8 model.
-        model: An instance of the `YOLOv8` class containing the YOLOv8 model.
-
-    Returns:
-        None
-
-    Raises:
-        None
-    """
-    source_vid = st.sidebar.selectbox(
-        "Choose a video...", settings.VIDEOS_DICT.keys())
-
-    is_display_tracker, tracker = display_tracker_options()
-
-    with open(settings.VIDEOS_DICT.get(source_vid), 'rb') as video_file:
-        video_bytes = video_file.read()
-    if video_bytes:
-        st.video(video_bytes)
-
-    if st.sidebar.button('Detect Drowing'):
-        s = time.time()
-        dcls = []
-        try:
-            vid_cap = cv2.VideoCapture(
-                str(settings.VIDEOS_DICT.get(source_vid)))
-            st_frame = st.empty()
-            while (vid_cap.isOpened()):
-                success, image = vid_cap.read()
-                if success:
-                    n = time.time()
-                    detectCls = _display_detected_frames(conf,
-                                             model,
-                                             st_frame,
-                                             image,
-                                             is_display_tracker,
-                                             tracker
-                                             )
-                    try: 
-                        if n-s > settings.timeout:
-                            s = n
-                            from collections import Counter
-                            element_counts = Counter(dcls)
-                            if max(element_counts, key=element_counts.get) == 0:
-                                st.write("Drowning, sending distress signal!")
-                                # audio_file = open(settings.AUDIO_PATH, 'rb')
-                                # audio_bytes = audio_file.read()
-                                # st.audio(audio_bytes, format='audio/mp4a')
-                                autoplay_audio(settings.AUDIO_PATH)
-                                send_message()
-                                
-                            dcls.clear()
-                            
-                        dcls.append(int(detectCls))
-                        # print(dcls)
-                    except:
-                        print(detectCls)
-                else:
-                    vid_cap.release()
-                    break
-        except Exception as e:
-            st.sidebar.error("Error loading video: " + str(e))
-
-
-import base64
-def autoplay_audio(file_path: str):
-    with open(file_path, "rb") as f:
+    with open(audio_path, "rb") as f:
         data = f.read()
-        b64 = base64.b64encode(data).decode()
-        md = f"""
-            <audio controls autoplay="true">
+
+    b64 = base64.b64encode(data).decode()
+
+    st.markdown(
+        f"""
+        <audio autoplay="true">
             <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
-            </audio>
-            """
-        st.markdown(
-            md,
-            unsafe_allow_html=True,
-        )
+        </audio>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-from twilio.rest import Client
-import requests
-def send_message():
-    print("\nsending distress signal")
-    directory = "runs/detect/predict"
-    img_path = glob.glob(os.path.join(directory, "*.jpg"))[0]
-    print(img_path)
-    api_key = settings.imgbb_api
-    image_path = img_path
+def _safe_name(name):
+    safe = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_"
+        for ch in str(name)
+    )
+    return safe.strip("_") or "camera"
 
-    with open(image_path, 'rb') as image_file:
-        response = requests.post(
-            'https://api.imgbb.com/1/upload',
-            params={'key': api_key},
-            files={'image': image_file}
-        )
 
-    if response.status_code == 200:
-        media_path = response.json()['data']['url']
-        try:
-            account_sid = settings.account_sid
-            auth_token = settings.auth_token
-            client = Client(account_sid, auth_token)
-            message = client.messages.create(
-                media_url=media_path,
-                from_=f'whatsapp:{settings.from_}',
-                body=f'{settings.alertmsg}',
-                to=f'whatsapp:{settings.to_}'
-            )
-            print(message.sid)
-        except Exception as e:
-            print(f"error with Twilio {e}")
-    else:
-        print("Failed to upload image")
+def _get_logger():
+    if "detection_logger" not in st.session_state:
+        st.session_state.detection_logger = DetectionLogger(str(settings.LOG_FILE))
 
-def play_multi_camera(conf, model, dashboard):
+    return st.session_state.detection_logger
 
-    manager = CameraManager()
 
-    alert = AlertManager(
+def _get_alert_manager():
+    signature = (
         settings.account_sid,
         settings.auth_token,
         settings.from_,
         settings.to_,
-        settings.imgbb_api
+        settings.imgbb_api,
     )
+
+    if st.session_state.get("alert_manager_signature") != signature:
+        st.session_state.alert_manager = AlertManager(
+            settings.account_sid,
+            settings.auth_token,
+            settings.from_,
+            settings.to_,
+            settings.imgbb_api,
+            evidence_dir=str(settings.IMAGE_DIR),
+        )
+        st.session_state.alert_manager_signature = signature
+
+    return st.session_state.alert_manager
+
+
+def _get_recorders():
+    if "video_recorders" not in st.session_state:
+        st.session_state.video_recorders = {}
+
+    return st.session_state.video_recorders
+
+
+def _get_recorder(camera_name):
+    recorders = _get_recorders()
+    key = _safe_name(camera_name)
+
+    if key not in recorders:
+        recorders[key] = VideoRecorder(
+            output_dir=str(settings.VIDEO_SAVE_DIR),
+            fps=settings.FPS,
+            codec=settings.VIDEO_CODEC,
+        )
+
+    return recorders[key]
+
+
+def _get_last_alerts():
+    if "last_detection_alerts" not in st.session_state:
+        st.session_state.last_detection_alerts = {}
+
+    return st.session_state.last_detection_alerts
+
+
+def _best_confidence(result):
+    try:
+        classes = result.boxes.cls.tolist()
+        confidences = result.boxes.conf.tolist()
+    except Exception:
+        return 0.0
+
+    drowning_scores = [
+        float(confidence)
+        for class_id, confidence in zip(classes, confidences)
+        if int(class_id) == DROWNING_CLASS_ID
+    ]
+
+    return max(drowning_scores) if drowning_scores else 0.0
+
+
+def _has_drowning(result):
+    confidence = _best_confidence(result)
+    return confidence >= DROWNING_ALERT_CONFIDENCE
+
+
+def _should_alert(camera_name):
+    last_alerts = _get_last_alerts()
+    now = time.time()
+    last = last_alerts.get(camera_name, 0)
+
+    if now - last < settings.ALERT_COOLDOWN:
+        return False
+
+    last_alerts[camera_name] = now
+    return True
+
+
+def _run_detection(model, frame, conf, tracking=False, tracker=None):
+    if tracking:
+        results = model.track(
+            frame,
+            conf=conf,
+            persist=True,
+            tracker=tracker,
+            verbose=False,
+        )
+    else:
+        results = model.predict(frame, conf=conf, verbose=False)
+
+    return results[0]
+
+
+def _write_active_recording(camera_name, frame):
+    recorder = _get_recorder(camera_name)
+
+    if recorder.is_recording():
+        recorder.write(frame)
+
+
+def _handle_drowning(frame, result, camera_name, location):
+    confidence = _best_confidence(result)
+
+    if confidence < DROWNING_ALERT_CONFIDENCE:
+        return
+
+    recorder = _get_recorder(camera_name)
+
+    if not recorder.is_recording():
+        recorder.start(frame, camera_name, duration=settings.RECORD_SECONDS)
+
+    recorder.write(frame)
+    video_path = recorder.current_path or ""
+
+    if not _should_alert(camera_name):
+        return
+
+    st.warning(f"Drowning detected: {camera_name}")
+    autoplay_audio(settings.AUDIO_PATH)
+
+    alert_manager = _get_alert_manager()
+    logger = _get_logger()
+
+    image_path, alert_sent = alert_manager.trigger(
+        frame,
+        camera_name,
+        location,
+        confidence,
+    )
+
+    logger.log(
+        camera_name,
+        location,
+        confidence,
+        image_path or "",
+        video_path,
+        bool(alert_sent),
+    )
+
+
+def _process_frame(
+    frame,
+    conf,
+    model,
+    camera_name,
+    location,
+    tracking=False,
+    tracker=None,
+):
+    frame = cv2.resize(frame, (720, int(720 * 9 / 16)))
+
+    result = _run_detection(
+        model,
+        frame,
+        conf,
+        tracking,
+        tracker,
+    )
+
+    plotted = result.plot()
+
+    _write_active_recording(camera_name, frame)
+
+    if _has_drowning(result):
+        _handle_drowning(frame, result, camera_name, location)
+
+    return plotted
+
+
+def _process_capture(
+    source,
+    conf,
+    model,
+    camera_name,
+    location,
+    tracking=False,
+    tracker=None,
+):
+    cap = cv2.VideoCapture(source)
+
+    if not cap.isOpened():
+        st.sidebar.error("Unable to open video source.")
+        return
+
+    st_frame = st.empty()
+
+    try:
+        while cap.isOpened():
+            success, frame = cap.read()
+
+            if not success:
+                break
+
+            plotted = _process_frame(
+                frame,
+                conf,
+                model,
+                camera_name,
+                location,
+                tracking,
+                tracker,
+            )
+
+            st_frame.image(
+                plotted,
+                caption="Detected Video",
+                channels="BGR",
+                use_container_width=True,
+            )
+
+    except Exception as exc:
+        st.sidebar.error(f"Error processing stream: {exc}")
+
+    finally:
+        cap.release()
+
+
+def play_stored_video(conf, model):
+    source_vid = st.sidebar.selectbox(
+        "Choose a video...",
+        settings.VIDEOS_DICT.keys(),
+    )
+
+    video_path = settings.VIDEOS_DICT.get(source_vid)
+
+    if video_path and Path(video_path).exists():
+        with open(video_path, "rb") as video_file:
+            st.video(video_file.read())
+    else:
+        st.warning("Selected video file was not found.")
+        return
+
+    tracking, tracker = display_tracker_options()
+
+    if st.sidebar.button("Detect Drowning"):
+        _process_capture(
+            str(video_path),
+            conf,
+            model,
+            camera_name=source_vid,
+            location="Stored Video",
+            tracking=tracking,
+            tracker=tracker,
+        )
+
+
+def play_webcam(conf, model):
+    tracking, tracker = display_tracker_options()
+
+    if st.sidebar.button("Detect Drowning"):
+        _process_capture(
+            settings.WEBCAM_PATH,
+            conf,
+            model,
+            camera_name="Webcam",
+            location="Local Webcam",
+            tracking=tracking,
+            tracker=tracker,
+        )
+
+
+def play_rtsp_stream(conf, model):
+    source_rtsp = st.sidebar.text_input("rtsp stream url:")
+
+    st.sidebar.caption(
+        "Example URL: rtsp://admin:12345@192.168.1.210:554/Streaming/Channels/101"
+    )
+
+    tracking, tracker = display_tracker_options()
+
+    if st.sidebar.button("Detect Drowning"):
+        if not source_rtsp:
+            st.sidebar.error("Please enter an RTSP URL.")
+            return
+
+        _process_capture(
+            source_rtsp,
+            conf,
+            model,
+            camera_name="RTSP",
+            location=source_rtsp,
+            tracking=tracking,
+            tracker=tracker,
+        )
+
+
+def _resolve_youtube_url(source_youtube):
+    ydl_opts = {
+        "format": "best[ext=mp4]/best",
+        "quiet": True,
+        "noplaylist": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(source_youtube, download=False)
+
+    return info.get("url") or info.get("formats", [{}])[-1].get("url")
+
+
+def play_youtube_video(conf, model):
+    st.sidebar.write("example link 1: https://youtu.be/3F6GsMESbDc")
+    source_youtube = st.sidebar.text_input("YouTube Video url")
+
+    tracking, tracker = display_tracker_options()
+
+    if st.sidebar.button("Detect Drowning"):
+        if not source_youtube:
+            st.sidebar.error("Please enter a YouTube URL.")
+            return
+
+        try:
+            video_url = _resolve_youtube_url(source_youtube)
+
+            if not video_url:
+                st.sidebar.error("Unable to resolve YouTube video URL.")
+                return
+
+            parsed = urlparse(source_youtube)
+            location = parsed.netloc or "YouTube"
+
+            _process_capture(
+                video_url,
+                conf,
+                model,
+                camera_name="YouTube",
+                location=location,
+                tracking=tracking,
+                tracker=tracker,
+            )
+
+        except Exception as exc:
+            st.sidebar.error(f"Error loading YouTube video: {exc}")
+
+
+def _get_camera_manager():
+    config_path = str(settings.CAMERA_CONFIG)
+
+    if st.session_state.get("camera_config_path") != config_path:
+        old_manager = st.session_state.get("camera_manager")
+
+        if old_manager:
+            old_manager.stop()
+
+        st.session_state.camera_manager = CameraManager(config_path)
+        st.session_state.camera_config_path = config_path
+
+    return st.session_state.camera_manager
+
+
+def play_multi_camera(conf, model, dashboard):
+    manager = _get_camera_manager()
 
     st.header("Multi Camera Monitoring")
 
-    while True:
+    c1, c2, c3 = st.columns([1, 1, 6])
 
-        cameras = manager.get_frames()
+    with c1:
+        if st.button("Start"):
+            st.session_state.multi_camera_running = True
 
-        dashboard.statistics(cameras)
+    with c2:
+        if st.button("Stop"):
+            st.session_state.multi_camera_running = False
 
-        processed = []
+    with c3:
+        if st.button("Refresh Cameras"):
+            manager.reload()
 
-        for cam in cameras:
+    if "multi_camera_running" not in st.session_state:
+        st.session_state.multi_camera_running = True
 
-            frame = cam["frame"]
+    cameras = manager.get_frames()
+    processed = []
 
-            if frame is None:
+    for camera in cameras:
+        frame = camera.get("frame")
 
-                processed.append(cam)
+        if frame is None:
+            camera["drowning"] = False
+            camera["confidence"] = 0.0
+            processed.append(camera)
+            continue
 
-                continue
+        camera_name = camera.get("name", "Camera")
+        location = camera.get("location", "Unknown")
 
-            result = model.predict(
+        try:
+            result = _run_detection(
+                model,
                 frame,
-                conf=conf,
-                verbose=False
+                conf,
+                tracking=False,
             )
 
-            plotted = result[0].plot()
+            camera["frame"] = result.plot()
+            camera["drowning"] = _has_drowning(result)
+            camera["confidence"] = _best_confidence(result)
 
-            cam["frame"] = plotted
+            _write_active_recording(camera_name, frame)
 
-            processed.append(cam)
+            if camera["drowning"]:
+                _handle_drowning(frame, result, camera_name, location)
 
-            try:
+        except Exception as exc:
+            camera["online"] = False
+            camera["error"] = str(exc)
 
-                classes = result[0].boxes.cls.tolist()
+        processed.append(camera)
 
-            except:
+    dashboard.statistics(processed)
+    dashboard.draw(processed)
 
-                classes = []
-
-            if 0 in classes:
-
-                st.warning(
-                    f"Drowning Detected in {cam['name']}"
-                )
-
-                autoplay_audio(
-                    settings.AUDIO_PATH
-                )
-
-                if not recorder.is_recording():
-
-                    recorder.start(
-                        frame,
-                        cam["name"]
-                    )
-
-                recorder.write(frame)
-
-                alert.trigger(
-
-                    frame,
-
-                    cam["name"],
-
-                    cam["location"],
-
-                    0.95
-
-                )
-
-                logger.log(
-
-                    cam["name"],
-
-                    cam["location"],
-
-                    0.95,
-
-                    "",
-
-                    "",
-
-                    True
-
-                )
-
-        dashboard.draw(processed)
+    if st.session_state.multi_camera_running:
+        time.sleep(0.15)
+        st.rerun()
