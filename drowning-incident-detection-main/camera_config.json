@@ -1,0 +1,18 @@
+{
+    "cameras": [
+        {
+            "id": 1,
+            "name": "Pool-1",
+            "location": "North Pool",
+            "source": 0,
+            "enabled": true
+        },
+        {
+            "id": 2,
+            "name": "Pool-2",
+            "location": "South Pool",
+            "source": 1,
+            "enabled": true
+        }
+    ]
+}

@@ -8,6 +8,7 @@ import streamlit as st
 # Local Modules
 import settings
 import helper
+from dashboard import Dashboard
 
 # Setting page layout
 st.set_page_config(
@@ -35,6 +36,9 @@ try:
 except Exception as ex:
     st.error(f"Unable to load model. Check the specified path: {model_path}")
     st.error(ex)
+
+dashboard = Dashboard()
+
 
 st.sidebar.header("Image/Video Config")
 source_radio = st.sidebar.radio(
@@ -89,6 +93,13 @@ elif source_radio == settings.RTSP:
 
 elif source_radio == settings.YOUTUBE:
     helper.play_youtube_video(confidence, model)
+
+elif source_radio == settings.MULTI_CAMERA:
+    helper.play_multi_camera(
+        confidence,
+        model,
+        dashboard
+    )
 
 else:
     st.error("Please select a valid source type!")

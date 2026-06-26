@@ -7,6 +7,15 @@ import shutil
 import settings
 import glob
 import yt_dlp
+from camera_manager import CameraManager
+from alert_manager import AlertManager
+from record_manager import VideoRecorder
+from logger import DetectionLogger
+import dashboard
+
+logger = DetectionLogger()
+
+recorder = VideoRecorder()
 
 
 
@@ -340,6 +349,54 @@ def play_stored_video(conf, model):
                     break
         except Exception as e:
             st.sidebar.error("Error loading video: " + str(e))
+
+def play_multi_camera(conf, model):
+
+    from camera_manager import CameraManager
+
+    manager = CameraManager()
+    col1, col2 = st.columns(2)
+
+    frame1 = col1.empty()
+    frame2 = col2.empty()
+
+    while True:
+
+        frames = manager.read_frames()
+
+        if len(frames) > 0:
+
+            if frames[0]["success"]:
+
+                res = model.predict(
+                    frames[0]["frame"],
+                    conf=conf
+                )
+
+                img = res[0].plot()
+
+                frame1.image(
+                    img,
+                    channels="BGR",
+                    caption=frames[0]["name"]
+                )
+
+        if len(frames) > 1:
+
+            if frames[1]["success"]:
+
+                res = model.predict(
+                    frames[1]["frame"],
+                    conf=conf
+                )
+
+                img = res[0].plot()
+
+                frame2.image(
+                    img,
+                    channels="BGR",
+                    caption=frames[1]["name"]
+                )
             
 import base64
 def autoplay_audio(file_path: str):
