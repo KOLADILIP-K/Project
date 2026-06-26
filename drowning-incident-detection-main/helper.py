@@ -223,6 +223,64 @@ def play_rtsp_stream(conf, model):
         except Exception as e:
             st.sidebar.error("Error loading video from RTSP: " + str(e))
 
+def process_detection(
+    frame,
+    result,
+    recorder,
+    alert,
+    logger,
+    camera_name,
+    location
+):
+
+    try:
+        classes = result[0].boxes.cls.tolist()
+    except:
+        classes = []
+
+    if 0 not in classes:
+        return
+
+    st.warning(f"⚠ Drowning Detected : {camera_name}")
+
+    autoplay_audio(settings.AUDIO_PATH)
+
+    if not recorder.is_recording():
+
+        recorder.start(
+            frame,
+            camera_name
+        )
+
+    recorder.write(frame)
+
+    alert.trigger(
+
+        frame,
+
+        camera_name,
+
+        location,
+
+        0.95
+
+    )
+
+    logger.log(
+
+        camera_name,
+
+        location,
+
+        0.95,
+
+        "",
+
+        "",
+
+        True
+
+    )
 
 def play_webcam(conf, model):
     """
@@ -350,54 +408,7 @@ def play_stored_video(conf, model):
         except Exception as e:
             st.sidebar.error("Error loading video: " + str(e))
 
-def play_multi_camera(conf, model):
 
-    from camera_manager import CameraManager
-
-    manager = CameraManager()
-    col1, col2 = st.columns(2)
-
-    frame1 = col1.empty()
-    frame2 = col2.empty()
-
-    while True:
-
-        frames = manager.read_frames()
-
-        if len(frames) > 0:
-
-            if frames[0]["success"]:
-
-                res = model.predict(
-                    frames[0]["frame"],
-                    conf=conf
-                )
-
-                img = res[0].plot()
-
-                frame1.image(
-                    img,
-                    channels="BGR",
-                    caption=frames[0]["name"]
-                )
-
-        if len(frames) > 1:
-
-            if frames[1]["success"]:
-
-                res = model.predict(
-                    frames[1]["frame"],
-                    conf=conf
-                )
-
-                img = res[0].plot()
-
-                frame2.image(
-                    img,
-                    channels="BGR",
-                    caption=frames[1]["name"]
-                )
-            
 import base64
 def autoplay_audio(file_path: str):
     with open(file_path, "rb") as f:
@@ -448,3 +459,104 @@ def send_message():
             print(f"error with Twilio {e}")
     else:
         print("Failed to upload image")
+
+def play_multi_camera(conf, model, dashboard):
+
+    manager = CameraManager()
+
+    alert = AlertManager(
+        settings.account_sid,
+        settings.auth_token,
+        settings.from_,
+        settings.to_,
+        settings.imgbb_api
+    )
+
+    st.header("Multi Camera Monitoring")
+
+    while True:
+
+        cameras = manager.get_frames()
+
+        dashboard.statistics(cameras)
+
+        processed = []
+
+        for cam in cameras:
+
+            frame = cam["frame"]
+
+            if frame is None:
+
+                processed.append(cam)
+
+                continue
+
+            result = model.predict(
+                frame,
+                conf=conf,
+                verbose=False
+            )
+
+            plotted = result[0].plot()
+
+            cam["frame"] = plotted
+
+            processed.append(cam)
+
+            try:
+
+                classes = result[0].boxes.cls.tolist()
+
+            except:
+
+                classes = []
+
+            if 0 in classes:
+
+                st.warning(
+                    f"Drowning Detected in {cam['name']}"
+                )
+
+                autoplay_audio(
+                    settings.AUDIO_PATH
+                )
+
+                if not recorder.is_recording():
+
+                    recorder.start(
+                        frame,
+                        cam["name"]
+                    )
+
+                recorder.write(frame)
+
+                alert.trigger(
+
+                    frame,
+
+                    cam["name"],
+
+                    cam["location"],
+
+                    0.95
+
+                )
+
+                logger.log(
+
+                    cam["name"],
+
+                    cam["location"],
+
+                    0.95,
+
+                    "",
+
+                    "",
+
+                    True
+
+                )
+
+        dashboard.draw(processed)
