@@ -64,6 +64,7 @@ AUDIO_PATH = "distress.mp3"
 MODEL_DIR = ROOT / "weights"
 
 DETECTION_MODEL = MODEL_DIR / "best.pt"
+PERSON_MODEL = MODEL_DIR / "yolo11n.pt"
 
 # -----------------------------
 # Webcam
@@ -84,7 +85,16 @@ FRAME_HEIGHT = 480
 # -----------------------------
 # Detection
 # -----------------------------
-CONFIDENCE = 0.25
+CONFIDENCE = 0.15
+
+# Minimum confidence required on a frame for a drowning detection to count toward the alert
+DROWNING_ALERT_CONFIDENCE = 0.38
+
+# Safe frame confirmation threshold: number of consecutive drowning frames required to trigger alarm
+SAFE_DROWNING_FRAMES = 8
+
+# Number of consecutive safe frames required to silence and clear an active alarm
+SAFE_RECOVERY_FRAMES = 5
 
 # Do not treat ordinary dry webcam scenes as swimming/drowning events.  The
 # guard only changes labels when no substantial bright blue pool-water area is

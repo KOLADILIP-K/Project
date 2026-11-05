@@ -14,13 +14,14 @@ from camera_manager import CameraManager
 from logger import DetectionLogger
 from record_manager import VideoRecorder
 from scene_guard import (
+    combine_drowning_and_person_detections,
     correct_dry_scene_predictions,
     remove_conflicting_overlaps,
     suppress_weak_scene_conflicts,
 )
 
 DROWNING_CLASS_ID = 0
-DROWNING_ALERT_CONFIDENCE = 0.60
+DROWNING_ALERT_CONFIDENCE = getattr(settings, "DROWNING_ALERT_CONFIDENCE", 0.38)
 
 
 @st.cache_resource
@@ -38,7 +39,7 @@ def display_tracker_options():
     return False, None
 
 
-def autoplay_audio(file_path):
+def play_alarm_audio(file_path, placeholder=None):
     audio_path = Path(file_path)
 
     if not audio_path.is_absolute():
@@ -52,14 +53,24 @@ def autoplay_audio(file_path):
 
     b64 = base64.b64encode(data).decode()
 
-    st.markdown(
-        f"""
-        <audio autoplay="true">
+    audio_html = f"""
+        <audio autoplay="true" loop="true">
             <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
         </audio>
-        """,
-        unsafe_allow_html=True,
-    )
+    """
+    if placeholder is not None:
+        placeholder.markdown(audio_html, unsafe_allow_html=True)
+    else:
+        st.markdown(audio_html, unsafe_allow_html=True)
+
+
+def stop_alarm_audio(placeholder=None):
+    if placeholder is not None:
+        placeholder.empty()
+
+
+def autoplay_audio(file_path):
+    play_alarm_audio(file_path)
 
 
 def _safe_name(name):
@@ -192,6 +203,7 @@ def _run_detection(model, frame, conf, tracking=False, tracker=None):
         enabled=settings.DRY_SCENE_GUARD_ENABLED,
         min_fraction=settings.MIN_POOL_WATER_FRACTION,
     )
+    result = combine_drowning_and_person_detections(result, frame)
     return suppress_weak_scene_conflicts(remove_conflicting_overlaps(result))
 
 
@@ -203,6 +215,7 @@ def refine_predictions(result, frame):
         enabled=settings.DRY_SCENE_GUARD_ENABLED,
         min_fraction=settings.MIN_POOL_WATER_FRACTION,
     )
+    result = combine_drowning_and_person_detections(result, frame)
     return suppress_weak_scene_conflicts(remove_conflicting_overlaps(result))
 
 
@@ -213,11 +226,41 @@ def _write_active_recording(camera_name, frame):
         recorder.write(frame)
 
 
-def _handle_drowning(frame, result, camera_name, location):
-    confidence = _best_confidence(result)
+def _get_camera_state(camera_name):
+    if "camera_states" not in st.session_state:
+        st.session_state.camera_states = {}
+    key = _safe_name(camera_name)
+    if key not in st.session_state.camera_states:
+        st.session_state.camera_states[key] = {
+            "consecutive_drowning": 0,
+            "consecutive_safe": 0,
+            "alarm_active": False,
+            "audio_playing": False,
+        }
+    return st.session_state.camera_states[key]
 
-    if confidence < DROWNING_ALERT_CONFIDENCE:
-        return
+
+def _update_incident_state(camera_name, has_drowning, best_conf):
+    state = _get_camera_state(camera_name)
+    safe_frames_threshold = getattr(settings, "SAFE_DROWNING_FRAMES", 8)
+    recovery_frames_threshold = getattr(settings, "SAFE_RECOVERY_FRAMES", 5)
+
+    if has_drowning and best_conf >= DROWNING_ALERT_CONFIDENCE:
+        state["consecutive_drowning"] += 1
+        state["consecutive_safe"] = 0
+        if state["consecutive_drowning"] >= safe_frames_threshold:
+            state["alarm_active"] = True
+    else:
+        state["consecutive_safe"] += 1
+        state["consecutive_drowning"] = 0
+        if state["consecutive_safe"] >= recovery_frames_threshold:
+            state["alarm_active"] = False
+
+    return state
+
+
+def _handle_drowning(frame, result, camera_name, location, state=None, audio_placeholder=None):
+    confidence = _best_confidence(result)
 
     recorder = _get_recorder(camera_name)
 
@@ -227,11 +270,13 @@ def _handle_drowning(frame, result, camera_name, location):
     recorder.write(frame)
     video_path = recorder.current_path or ""
 
+    # Ensure continuous alarm is sounding while drowning persists
+    if state is not None and not state.get("audio_playing", False):
+        play_alarm_audio(settings.AUDIO_PATH, placeholder=audio_placeholder)
+        state["audio_playing"] = True
+
     if not _should_alert(camera_name):
         return
-
-    st.warning(f"Drowning detected: {camera_name}")
-    autoplay_audio(settings.AUDIO_PATH)
 
     alert_manager = _get_alert_manager()
     logger = _get_logger()
@@ -242,6 +287,9 @@ def _handle_drowning(frame, result, camera_name, location):
         location,
         confidence,
     )
+
+    if getattr(alert_manager, "last_uploaded_url", None):
+        st.sidebar.success(f"☁️ Snapshot uploaded to ImgBB Cloud: {alert_manager.last_uploaded_url}")
 
     logger.log(
         camera_name,
@@ -261,6 +309,7 @@ def _process_frame(
     location,
     tracking=False,
     tracker=None,
+    audio_placeholder=None,
 ):
     frame = cv2.resize(frame, (720, int(720 * 9 / 16)))
 
@@ -276,10 +325,19 @@ def _process_frame(
 
     _write_active_recording(camera_name, frame)
 
-    if _has_drowning(result):
-        _handle_drowning(frame, result, camera_name, location)
+    has_drowning_in_frame = _has_drowning(result)
+    best_conf = _best_confidence(result)
+    state = _update_incident_state(camera_name, has_drowning_in_frame, best_conf)
 
-    return plotted
+    if state["alarm_active"]:
+        _handle_drowning(frame, result, camera_name, location, state, audio_placeholder)
+    else:
+        # If alarm was active and is now stopped, silence audio
+        if state.get("audio_playing", False):
+            stop_alarm_audio(audio_placeholder)
+            state["audio_playing"] = False
+
+    return plotted, result, state
 
 
 def _process_capture(
@@ -291,22 +349,55 @@ def _process_capture(
     tracking=False,
     tracker=None,
 ):
-    cap = cv2.VideoCapture(source)
+    is_webcam = (source == 0 or source == settings.WEBCAM_PATH)
+    if is_webcam:
+        # On Windows, cv2.CAP_DSHOW prevents webcam from hanging or freezing
+        cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(source)
+    else:
+        cap = cv2.VideoCapture(source)
 
     if not cap.isOpened():
-        st.sidebar.error("Unable to open video source.")
+        st.sidebar.error("Unable to open video source. If webcam is in use, please close other apps.")
         return
 
+    # Stop button controls
+    col_stop, _ = st.columns([2, 5])
+    with col_stop:
+        stop_stream = st.button("⏹ Stop Detection / Camera", key=f"stop_{camera_name}")
+
+    dashboard_placeholder = st.empty()
     st_frame = st.empty()
+    audio_placeholder = st.empty()
+
+    # Reset camera state at start of stream/video run
+    state = _get_camera_state(camera_name)
+    state["consecutive_drowning"] = 0
+    state["consecutive_safe"] = 0
+    state["alarm_active"] = False
+    state["audio_playing"] = False
+    stop_alarm_audio(audio_placeholder)
 
     try:
+        consecutive_failures = 0
         while cap.isOpened():
-            success, frame = cap.read()
-
-            if not success:
+            if stop_stream:
                 break
 
-            plotted = _process_frame(
+            success, frame = cap.read()
+
+            if not success or frame is None:
+                if is_webcam and consecutive_failures < 10:
+                    consecutive_failures += 1
+                    time.sleep(0.05)
+                    continue
+                break
+
+            consecutive_failures = 0
+
+            plotted, result, state = _process_frame(
                 frame,
                 conf,
                 model,
@@ -314,7 +405,31 @@ def _process_capture(
                 location,
                 tracking,
                 tracker,
+                audio_placeholder=audio_placeholder,
             )
+
+            num_persons = len(result.boxes) if result.boxes is not None else 0
+            best_conf = _best_confidence(result)
+            if state["alarm_active"]:
+                dashboard_placeholder.markdown(
+                    f"""
+                    <div style="background-color: #d32f2f; padding: 14px; border-radius: 8px; color: white; text-align: center; margin-bottom: 12px; border: 2px solid #b71c1c;">
+                        <h2 style="margin: 0; color: white;">🚨 ALARM TRIGGERED — DROWNING DETECTED!</h2>
+                        <p style="margin: 4px 0 0 0; font-size: 15px;">Source: <b>{camera_name}</b> | Persons: <b>{num_persons}</b> | Confidence: <b>{best_conf * 100:.1f}%</b> | Sustained Frames: <b>{state['consecutive_drowning']}</b></p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                dashboard_placeholder.markdown(
+                    f"""
+                    <div style="background-color: #1b5e20; padding: 10px; border-radius: 8px; color: white; text-align: center; margin-bottom: 12px; border: 1px solid #2e7d32;">
+                        <h3 style="margin: 0; color: white;">🟢 STATUS: NORMAL (Monitoring Active)</h3>
+                        <p style="margin: 4px 0 0 0; font-size: 14px;">Source: <b>{camera_name}</b> | Detected Persons: <b>{num_persons}</b> | Safe Frames: <b>{state['consecutive_safe']}</b></p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
             st_frame.image(
                 plotted,
@@ -328,6 +443,8 @@ def _process_capture(
 
     finally:
         cap.release()
+        stop_alarm_audio(audio_placeholder)
+        state["audio_playing"] = False
 
 
 def play_stored_video(conf, model):
@@ -484,14 +601,17 @@ def play_multi_camera(conf, model, dashboard):
     if "multi_camera_running" not in st.session_state:
         st.session_state.multi_camera_running = True
 
+    audio_placeholder = st.empty()
     cameras = manager.get_frames()
     processed = []
+    any_active_alarm = False
 
     for camera in cameras:
         frame = camera.get("frame")
 
         if frame is None:
             camera["drowning"] = False
+            camera["alarm_triggered"] = False
             camera["confidence"] = 0.0
             processed.append(camera)
             continue
@@ -508,19 +628,28 @@ def play_multi_camera(conf, model, dashboard):
             )
 
             camera["frame"] = result.plot()
-            camera["drowning"] = _has_drowning(result)
-            camera["confidence"] = _best_confidence(result)
+            has_drown = _has_drowning(result)
+            best_conf = _best_confidence(result)
+            state = _update_incident_state(camera_name, has_drown, best_conf)
+
+            camera["drowning"] = state["alarm_active"]
+            camera["alarm_triggered"] = state["alarm_active"]
+            camera["confidence"] = best_conf
 
             _write_active_recording(camera_name, frame)
 
-            if camera["drowning"]:
-                _handle_drowning(frame, result, camera_name, location)
+            if state["alarm_active"]:
+                any_active_alarm = True
+                _handle_drowning(frame, result, camera_name, location, state, audio_placeholder)
 
         except Exception as exc:
             camera["online"] = False
             camera["error"] = str(exc)
 
         processed.append(camera)
+
+    if not any_active_alarm:
+        stop_alarm_audio(audio_placeholder)
 
     dashboard.statistics(processed)
     dashboard.draw(processed)

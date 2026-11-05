@@ -106,6 +106,7 @@ class AlertManager:
             if response.status_code == 200:
                 data = response.json()
                 image_url = data["data"]["url"]
+                self.last_uploaded_url = image_url
                 print(f"[INFO] Image uploaded to ImgBB: {image_url}")
                 return image_url
 
@@ -113,6 +114,7 @@ class AlertManager:
         except Exception as exc:
             print(f"[ERROR] ImgBB upload failed: {exc}")
 
+        self.last_uploaded_url = None
         return None
 
     @classmethod

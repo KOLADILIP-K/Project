@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+app_test.py
+
+# Local runtime and generated artifacts
+Microsoft/
+evidence/
+runs/
+logs/
+public-drowning-dataset/datasets/*.zip
+
+# Root duplicate files (canonical project source resides in drowning-incident-detection-main/)
+/alert_manager.py
+/app.py
+/best.pt
+/camera_config.json
+/camera_manager.py
+/dashboard.py
+/distress.mp3
+/docker-compose.yml
+/helper.py
+/images/
+/installs.txt
+/logger.py
+/model_test.py
+/packages.txt
+/public-drowning-dataset/
+/qr_code.png
+/record_manager.py
+/requirements.txt
+/run.py
+/scene_guard.py
+/settings.py
+/setup.py
+/start.bat
+/twilio_test.py
+/videos/
+/waha_test.py
+/weights/

@@ -23,12 +23,19 @@ class Dashboard:
         online = sum(1 for cam in camera_data if cam.get("online"))
         offline = total - online
         detections = sum(1 for cam in camera_data if cam.get("drowning"))
+        alarm_triggered = any(cam.get("drowning") or cam.get("alarm_triggered") for cam in camera_data)
 
-        c1, c2, c3, c4 = st.columns(4)
+        if alarm_triggered:
+            st.error("## 🚨 ALARM TRIGGERED — POTENTIAL DROWNING INCIDENT IN PROGRESS!")
+        else:
+            st.success("## 🟢 STATUS: NORMAL — All Monitored Areas Secure")
+
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Total Cameras", total)
         c2.metric("Online", online)
         c3.metric("Offline", offline)
         c4.metric("Detections", detections)
+        c5.metric("Alarm Status", "🚨 TRIGGERED" if alarm_triggered else "🟢 NORMAL")
 
     def draw(self, camera_data):
         count = len(camera_data)
@@ -52,14 +59,16 @@ class Dashboard:
 
                 with col:
                     status = "Online" if camera.get("online") else "Offline"
-                    detection = camera.get("drowning", False)
+                    detection = camera.get("drowning", False) or camera.get("alarm_triggered", False)
                     confidence = camera.get("confidence", 0.0)
 
                     st.markdown(f"### 📷 {camera.get('name', 'Camera')}")
                     st.caption(f"{camera.get('location', 'Unknown')} | {status}")
 
                     if detection:
-                        st.error(f"Drowning detected ({confidence:.2f})")
+                        st.error(f"🚨 **ALARM TRIGGERED** ({confidence * 100:.1f}%)")
+                    else:
+                        st.caption("🟢 Status: Safe")
 
                     if camera.get("error"):
                         st.warning(camera["error"])

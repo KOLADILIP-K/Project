@@ -39,34 +39,137 @@ def has_visible_pool_water(frame_bgr, min_fraction=0.08):
     return water_fraction >= min_fraction
 
 
+_PERSON_MODEL = None
+
+
+def get_person_model():
+    """Lazily load the COCO person detector model for reliable multi-person detection."""
+    global _PERSON_MODEL
+    if _PERSON_MODEL is None:
+        from pathlib import Path
+        from ultralytics import YOLO
+        import settings
+
+        model_candidates = [
+            getattr(settings, "PERSON_MODEL", None),
+            settings.ROOT / "weights" / "yolo11n.pt",
+            settings.ROOT / "public-drowning-dataset" / "Module" / "yolo11n.pt",
+        ]
+
+        for cand in model_candidates:
+            if cand and Path(cand).exists():
+                try:
+                    _PERSON_MODEL = YOLO(str(cand))
+                    break
+                except Exception:
+                    continue
+
+    return _PERSON_MODEL
+
+
 def correct_dry_scene_predictions(result, frame_bgr, enabled=True, min_fraction=0.08):
     """Relabel detections as out-of-water when no pool water is visible.
 
-    The result is updated before plotting and alert checks, so an indoor webcam
-    frame cannot appear as a swimming/drowning event simply because it contains
-    a person.
+    In dry scenes (such as an indoor webcam), the generic person model is used
+    to cleanly detect each individual person, preventing two people from being
+    merged into a single inaccurate box.
     """
     if not enabled or has_visible_pool_water(frame_bgr, min_fraction):
         return result
 
     out_of_water_id = _class_id(result, "Person out of water")
-    if out_of_water_id is None or result.boxes is None or len(result.boxes) == 0:
-        return result
+    if out_of_water_id is None:
+        out_of_water_id = 1
 
-    # Ultralytics inference tensors are read-only.  Replace the backing tensor
-    # with a normal copy before changing its final (class-id) column.
-    result.boxes.data = result.boxes.data.clone()
-    result.boxes.data[:, -1] = out_of_water_id
+    person_model = get_person_model()
+    if person_model is not None and frame_bgr is not None:
+        try:
+            person_res = person_model.predict(frame_bgr, classes=[0], conf=0.25, verbose=False)[0]
+            if person_res.boxes is not None and len(person_res.boxes) > 0:
+                data = person_res.boxes.data.clone()
+                data[:, -1] = float(out_of_water_id)
+                result.boxes.data = data
+                return result
+        except Exception:
+            pass
+
+    if result.boxes is not None and len(result.boxes) > 0:
+        result.boxes.data = result.boxes.data.clone()
+        result.boxes.data[:, -1] = float(out_of_water_id)
+
     return result
 
 
-def remove_conflicting_overlaps(result, iou_threshold=0.45):
+def combine_drowning_and_person_detections(result, frame_bgr):
+    """Ensemble person detection to ensure every person in water/deck is detected."""
+    person_model = get_person_model()
+    if person_model is None or frame_bgr is None:
+        return result
+
+    try:
+        person_res = person_model.predict(frame_bgr, classes=[0], conf=0.25, verbose=False)[0]
+        if person_res.boxes is None or len(person_res.boxes) == 0:
+            return result
+
+        out_of_water_id = _class_id(result, "Person out of water")
+        if out_of_water_id is None:
+            out_of_water_id = 1
+
+        existing_coords = (
+            result.boxes.xyxy.cpu().numpy()
+            if result.boxes is not None and len(result.boxes) > 0
+            else np.empty((0, 4))
+        )
+        additional_boxes = []
+
+        for p_box in person_res.boxes.data:
+            p_coords = p_box[:4].cpu().numpy()
+            p_area = max(0.0, p_coords[2] - p_coords[0]) * max(0.0, p_coords[3] - p_coords[1])
+            overlaps = False
+
+            for e_coords in existing_coords:
+                inter_x = max(0.0, min(p_coords[2], e_coords[2]) - max(p_coords[0], e_coords[0]))
+                inter_y = max(0.0, min(p_coords[3], e_coords[3]) - max(p_coords[1], e_coords[1]))
+                inter_area = inter_x * inter_y
+                if inter_area > 0 and p_area > 0:
+                    e_area = max(0.0, e_coords[2] - e_coords[0]) * max(0.0, e_coords[3] - e_coords[1])
+                    min_area = min(p_area, e_area)
+                    io_min = inter_area / min_area if min_area > 0 else 0
+                    iou = inter_area / (p_area + e_area - inter_area)
+                    # If high IoU or one box is inside another, it describes the same person
+                    if iou > 0.20 or io_min > 0.30:
+                        overlaps = True
+                        break
+
+            if not overlaps:
+                new_box = p_box.clone()
+                new_box[-1] = float(out_of_water_id)
+                additional_boxes.append(new_box)
+
+        if additional_boxes:
+            import torch
+
+            if result.boxes is not None and len(result.boxes) > 0:
+                all_boxes = torch.cat(
+                    [result.boxes.data] + [b.unsqueeze(0) for b in additional_boxes], dim=0
+                )
+            else:
+                all_boxes = torch.stack(additional_boxes, dim=0)
+
+            result.boxes.data = all_boxes
+    except Exception:
+        pass
+
+    return result
+
+
+def remove_conflicting_overlaps(result, iou_threshold=0.65):
     """Keep one label when several class boxes describe the same person.
 
-    Ultralytics performs non-maximum suppression per class.  A model can
+    Ultralytics performs non-maximum suppression per class. A model can
     therefore return overlapping Swimming, Drowning, and out-of-water boxes for
-    one person.  This second, class-agnostic pass retains the most confident
-    box while preserving boxes for separate people.
+    one person. This second pass retains the most confident box when boxes
+    have high overlap (same person), while preserving separate individuals.
     """
     if result.boxes is None or len(result.boxes) < 2:
         return result
@@ -89,7 +192,10 @@ def remove_conflicting_overlaps(result, iou_threshold=0.45):
             )
             accepted_area = max(0.0, a_right - a_left) * max(0.0, a_bottom - a_top)
             union = candidate_area + accepted_area - intersection
-            if union and intersection / union >= iou_threshold:
+            min_area = min(candidate_area, accepted_area)
+            io_min = intersection / min_area if min_area > 0 else 0
+            iou = intersection / union if union > 0 else 0
+            if iou >= iou_threshold or io_min >= 0.40:
                 overlaps = True
                 break
 
